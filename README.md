@@ -1,0 +1,2 @@
+# Machine Learning Project with R
+ The project utilizes machine learning models including linear regression, decision trees, and K-nearest neighbors (KNN), combined with clustering analysis, to predict audience size in YouTube data. Through the comprehensive application of these models, it can more accurately forecast the popularity of videos, providing valuable support and decision-making insights for content creators and platform administrators.

@@ -1,0 +1,1380 @@
+---
+title: Modelling for Global Youtube Dataset
+subtitle: Project 2 - CITS4009
+graphics: yes
+author: <i>Karen Huan Yi LEE(23715313) & Yiren WANG(23794201)</i>
+date: September 21, 2023
+encoding: UTF-8 
+output:
+  html_document:
+    toc: true 
+    toc_float: 
+      collapsed: false
+      smooth_scroll: True
+    toc_depth: 5  
+    number_sections: false 
+    theme: paper 
+    highlight: monochrome  
+    fig_caption: true
+    code_folding: show
+---
+
+# Teamwork Distribution
+
+Yiren Wang(23794201) (50%): Data cleaning and transformation, Single variable classification, clustering, Shiny App
+
+Karen Huan Yi Lee(23715313) (50%): Data cleaning and transformation, multivariate classification, clustering, Shiny App
+
+# Shiny App
+
+Here is the [link](https://youtu.be/ON0PmH8jpnA) for our YouTube video.
+
+# Introduction
+
+The dataset analyzed in this project is called **Global Youtube Statistics 2023**, which can be obtained from Kaggle platform and it can be downloaded on [Kaggle](https://www.kaggle.com/datasets/nelgiriyewithana/global-youtube-statistics-2023).
+
+This dataset was collected by a Sri Lanka data scientist name *Nidula Elgiriyewithana*. In this data, he recorded plenty of data abut different aspexts of YouTube by collecting datasets from YouTube gients. This dateset provided includes information such as video views, upload frequency, country of origin, earnings.
+
+# Data preparation
+
+## Library loading and Set up
+
+*First, Set up the random seed and sanitize the working environment.*
+
+```{r, warning=FALSE}
+rm(list = ls())
+set.seed(2379)
+```
+
+*Then, load the libraries.*
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(tidyverse)
+library(ROCR)
+library(knitr)
+library(tibble)
+library(plotly)
+library(lime)
+library(rpart)
+library(rpart.plot)
+library(dendextend)
+library(vtreat)
+library(class)
+library(grDevices)
+library(factoextra)
+library(fpc)
+```
+
+## Load Data
+
+*Assign the dataset to the variable 'YT' after reading the csv file and importing it into R.*
+
+```{r}
+YT <- read.csv("./youtube_UTF_8.csv", header = TRUE, encoding = "UTF-8")
+```
+
+## Data Cleaning
+
+```{r}
+# Replace all the missing values with NA
+YT[YT == ""] <- NaN
+
+YT <- YT %>%
+  mutate(
+    allunemployment = (Unemployment.rate / 100) * Population,
+    unemployment_urban = (Unemployment.rate / 100) * Urban_population,
+    educationall = (Gross.tertiary.education.enrollment.... / 100) * Population,
+    educationurban = (Gross.tertiary.education.enrollment.... / 100) * Urban_population
+  )
+
+YT <- subset(YT, select = -c(Youtuber, Longitude, Latitude, Title, country_rank, Abbreviation, channel_type_rank,Gross.tertiary.education.enrollment....,Unemployment.rate,video_views_rank))
+
+
+YT$created_year <- as.character(YT$created_year)
+YT$created_date <- as.character(YT$created_date)
+
+
+# replace all the "nan" values in categorical variables to "missing"
+YT[] <- lapply(YT, function(x) {
+  if (is.character(x)) {
+    x[x == "nan"] <- "missing"
+  }
+  return(x)
+})
+
+# delete the rows that have missing values in all numerical variables except Longitude and Latitude
+YT <- YT[!(rowSums(is.na(YT[, -c(1, 2)])) == ncol(YT) - 2), ]
+
+# Change missing values with the median value in the certain columns
+median_re <- function(YT) {
+  nucol <- setdiff(names(YT), c("created_year", "created_date", "rank"))
+  
+  for (col in nucol) {
+    if (is.numeric(YT[[col]])) {
+      YT[[col]][is.na(YT[[col]])] <- median(YT[[col]], na.rm = TRUE)
+    }
+  }
+  
+  return(YT)
+}
+YT <-  median_re(YT)
+
+cand.columns <- names(YT)[names(YT) != 'subscribers']
+str(YT)
+```
+
+Firstly, the missing values are replaced with 'NaN' and irrelevant columns are removed. 'Missing' is the default value for categorical variables containing the character 'nan'. In order to identify interactions such as unemployment rates multiplied by population metrics and tertiary education enrollment rates multiplied by population, feature engineering is used to construct new variables based on current columns. Particularly, rows with entirely missing numerical data, apart from `Longitude` and `Latitude`, are eliminated. The data integrity is then maintained by using medians to impute missing numerical values. Data cleaning is vital for maintaining the dataset's quality and dependability for analytical purposes and for preparing it for later machine learning modelling.
+
+# Classification
+
+## Target Variable
+
+In the analysis, the target (response) variable selected is a newly indicated column `subscribersup`, which indicates the number of YouTube channel subscribers. This variable has been carefully crafted to create a distinct difference between channels that have a large and low subscriber base. Based on the median value, the dataset is separated into two groups: the majority of channels have subscribers below 17,700,000, while the top 5% of the data are channels with subscribers at or above this level. Channels with a lower subscriber count are labeled [1, 1.77e+07], while channels with a greater subscriber count are labeled [1.77e+07, Inf]. The target variable is designed to offer practical insights into audience engagement, content strategy, and advertising prospects as a focus point of analysis for enhancing YouTube channel performance and impact.
+
+```{r}
+YT <- YT %>%
+  mutate(subscribersup = cut(subscribers, breaks = c(0, 17700000, Inf), include.lowest=T, right=F)) %>% 
+  
+  filter(!is.na(subscribersup))
+table(YT$subscribersup)
+```
+
+```{r}
+YT$subscribersupbool <- YT$subscribers >= median(YT$subscribers)
+target <- 'subscribersup'
+pos.label <- "[1.77e+07,Inf]"
+YT <- YT %>%
+  select(-subscribers)
+```
+
+By examining the proportions of outcome variables selected, it can be observed that the outcome is distributed equally. Building reliable and unbiased machine learning models requires balanced representation of both classes: low-subscriber and high-subscriber, which is accomplished by an equal distribution. Balanced class is essential in the context of classification tasks since it avoids the model from being biased towards predicting the majority class, ensuring fair evaluation and trustworthy insights into the reasons influencing high subscriber counts.
+
+## Feature Variable
+
+In order to improve the effectiveness and accuracy of machine learning models, feature selection is a vital step. To reduce complexity and improve model performance, it involves selecting relevant features from a dataset (Khalid, Khalil, & Nasreen, 2014). The correlation coefficient stands out among the numerous techniques as a useful statistical measure, illuminating the strength and direction of correlations between variables. This coefficient shows to be an essential tool in the field of machine learning, assisting in the discovery and choice of the features that have the greatest impact on the target variable (Hsu & Hsieh, 2010).
+
+Benefits of Correlation Coefficient Feature Selection:
+
+1.  **Improve Model Performance:** The model's ability to recognize and generalize patterns is strengthened by removing unnecessary or redundant information. As a result, this improvement produces more accurate predictions on unobserved data, which is essential for guaranteeing the model's applicability and trustworthiness in the actual world (Tang, Alelyani, & Liu, 2014).
+2.  **Enhance Computational Efficiency:** Machine learning methods are less computationally complex when they operate on a reduced feature set. This decrease in complexity speeds up not just the training procedure but also the inference process. The ability to process enormous volumes of data quickly is crucial in the fast-paced world of current technology, making this feature selection consideration of crucial significance (Elssied, Ibrahim, & Osman, 2014).
+3.  **Interpretability and Insights:** Data scientists can better understand model interpretation and reveal complex correlations between features and the target variable using a smaller feature set. Understanding these relationships not only promotes better model comprehension but also provides data scientists with practical knowledge. The findings of the model are made more accessible and beneficial for stakeholders because to this interpretative clarity, which is crucial in decision-making processes (Karatza, Dalakleidi, Athanasiou, & Nikita, 2021).
+
+The correlation coefficient is employed for feature selection in the following data modelling process due to its proven efficiency. The advantages listed above, such as improved model performance, increased computational efficiency, and improved interpretability, make it clear why this method is essential for use in data science and machine learning. The correlation coefficient is used to ensure that machine learning models are accurate, efficient, and insightful, optimizing their influence across a variety of domains.
+
+```{r}
+# Identify categorical and numerical variables
+YTclass <- setdiff(colnames(YT), c(target,'subscribersup'))
+
+YTCV <- YT %>%
+  select(all_of(YTclass)) %>%
+  select_if(~ is.factor(.) || is.character(.)) %>%
+  names()
+
+YTNV <- YT %>%
+  select(all_of(YTclass)) %>%
+  select_if(~ is.numeric(.)) %>%
+  names()
+
+YTNV_cluster <- YT[YTNV]
+cat("There are ",length(YTCV)," categorical variables and ",length(YTNV), "numerical variables.")
+```
+
+The dataset YT's is being divided into two categories: categorical and numerical variables. Categorical variables are identified based on their factor or character data types whereas numerical variables are recognized based on their numeric data type.
+
+*Convert Categorical variables to numerical variables used for creating the single variable model, but still keep the original variable for future multivariate model*
+
+```{r}
+for (cV in YTCV) {
+  catcount <- table(YT[, cV])
+  countcv <- paste("Numerical", cV, sep = '_')
+  YT[countcv] <- catcount[match(YT[, cV], names(catcount))]
+}
+
+YTnewclass <- setdiff(colnames(YT), target)
+YTCV <- YT %>%
+  select(all_of(YTnewclass)) %>%
+  select_if(~ is.factor(.) || is.character(.)) %>%
+  names()
+
+YTNV <- YT %>%
+  select(all_of(YTnewclass)) %>%
+  select_if(~ is.numeric(.)) %>%
+  names()
+
+YTNVdata <- YT[sapply(YT, is.numeric) | sapply(YT, is.integer)]
+YTCVdata <- YT[sapply(YT, is.factor) | sapply(YT, is.character)]
+```
+
+The YT dataset is subjected to a transformation method. The approach initially counts the instances of distinct values for each categorical variable in `YTCV` and generates a new numerical variable to reflect these counts. In order to enable numerical analysis and modelling, the transformation effectively converts categorical variables into numerical variables.
+
+## Training and testing model
+
+*Using 60/20/20 method to separate the youtube dataset into Training, Calibration, and Testing data.*
+
+```{r}
+YTsaperate <- runif(nrow(YT))
+YTtrain <- YT[YTsaperate <= 0.6, ]
+YTCal <- YT[YTsaperate > 0.6 & YTsaperate <= 0.8, ]
+YTtest <- YT[YTsaperate > 0.8, ]
+
+cat("The training set has", nrow(YTtrain), "observations, the calibration set has", nrow(YTCal)," observations,and the test set has", nrow(YTtest), "observations.")
+
+```
+
+The *'runif'* function is used to do the splitting of the data at random, giving each row an equal chance of being assigned to each sets.
+
+# Models
+
+## Null model
+
+A *Null Model* is created, which is a simple approach that makes direct assumptions about the predictive power of the model beyond the positive class's base rate.
+
+```{r}
+YTNullm <- sum(YT$subscribersupbool) / nrow(YTtrain)
+```
+
+### AUC and Log Likelihood
+
+```{r}
+YTAUC <- function(predcol, outcol, pos=pos.label) {
+  perf <- performance(prediction(predcol, outcol==pos),'auc')
+  as.numeric(perf@y.values)
+}
+
+YTlog <- function(outCol, predCol, pos=pos.label) {
+  sum(ifelse(outCol==pos, log(predCol), log(1-predCol)))
+}
+
+baseRateCheck <- YTlog(YTCal[,target],  sum(YTCal[,target]==pos.label)/length(YTCal[,target]) )
+```
+
+```{r}
+modelsummary <- data.frame(
+  Name = 'Null Model',
+  Type = 'univariate',
+  AUC = YTAUC(rep(YTNullm, nrow(YTtest)), YTtest[, target])
+)
+
+kable(modelsummary)
+```
+
+The dataset is fairly balanced, therefore the model will predict `High.Subscribers (TRUE)` with a 50% probability, giving it an *Area Under the Curve (AUC)* of 0.5. The *Null Model* serves as a fundamental benchmark and its performance is assessed using the *AUC* metric. These assessments serve as a benchmark for subsequent machine learning models, making them significant. Any advanced model created after that should outperform the Null Model, indicating that it captures significant patterns in the dataset and is not just making predictions based on chance or the base rate.
+
+## Single Variable
+
+Create a function that will be used for model building:
+
+```{r}
+mkPredC <- function(outCol,varCol,appCol, pos=pos.label) {
+  pPos <- sum(outCol==pos)/length(outCol)
+  naTab <- table(as.factor(outCol[is.na(varCol)]))
+  pPosWna <- (naTab/sum(naTab))[pos]
+  vTab <- table(as.factor(outCol),varCol)
+  pPosWv <- (vTab[pos,]+1.0e-3*pPos)/(colSums(vTab)+1.0e-3)
+  pred <- pPosWv[appCol]
+  pred[is.na(appCol)] <- pPosWna
+  pred[is.na(pred)] <- pPos
+  pred
+}
+
+mkPredN <- function(outCol,varCol,appCol) {
+  cuts <- unique(as.numeric(quantile(varCol, probs=seq(0, 1, 0.1), na.rm=T)))
+  varC <- cut(varCol, cuts)
+  appC <- cut(appCol, cuts)
+  mkPredC(outCol, varC, appC)
+}
+```
+
+*AUC scores* are computed for each variable on both the training and calibration sets. Variables having *AUC* values over 0.5, showing predictive power superior to chance, are chosen for further analysis.
+
+The *AUC* result of single variable model is sorted and showned.
+
+```{r}
+AUCYTNV <- data.frame(Pred = character(), Type = character(), TrainAUC = numeric(), CalAUC = numeric())
+for (v in YTNV) {
+  predii <- paste('pred', v, sep = '.')
+  YTtrain[, predii] <- mkPredN(YTtrain[, target], YTtrain[, v], YTtrain[, v])
+  YTtest[, predii] <- mkPredN(YTtrain[, target], YTtrain[, v], YTtest[, v])
+  YTCal[, predii] <- mkPredN(YTtrain[, target], YTtrain[, v], YTCal[, v])
+  trainsetAUC <- YTAUC(YTtrain[, predii], YTtrain[, target])
+  
+  if (trainsetAUC >= 0.5) {
+    CalsetAUC <- YTAUC(YTCal[, predii], YTCal[, target])
+    AUCYTNV <- rbind(AUCYTNV, data.frame(Predictor = predii, Type = 'univariate', TrainAUC = trainsetAUC, CalAUC = CalsetAUC))
+  }
+}
+
+AUCYTNV <- AUCYTNV %>%
+  filter(!grepl("pred of subscribers", Predictor)) %>%
+  mutate(Differ = abs(TrainAUC - CalAUC)) %>%
+  arrange(Differ) %>%
+  select(-Differ) 
+kable(AUCYTNV, digits = 4, align = 'lccc')
+```
+
+```{r}
+ggplotly(ggplot(YTCal) +
+  geom_density(aes(x=pred.rank, color=as.factor(subscribersup))) +
+  labs(color = 'subscribers') +
+  theme_minimal())
+```
+
+Based on the *double density plot*, it can be observed that there is an absence of overlapping between two categories suggests that the `pred.rank` effectively distinguishes between low subscriber counts channels and high subscriber count channels.
+
+*Log likelihood* is computed for each single variable in the calibration set in order to evaluate how well the model fits. It is essential that the variables chosen can improve the prediction in order to make the best choices feasible. The variable is statistically significant if the log likelihood is close to the *base rate check value*.
+
+```{r}
+selPredVars <- character(0)
+selVars <- character(0)
+minStep <- baseRateCheck
+
+YTlogNV <- data.frame(Pred = character(0), 'Log likelihood' = numeric(0))
+
+
+for (v in YTNV) {
+  predii <- paste('pred', v, sep = '.')
+  likehoodlog <- sum(ifelse(YTCal[, target] == pos.label, log(YTCal[, predii]), log(1 - YTCal[, predii])))
+  
+  if (likehoodlog > minStep) {
+    selPredVars <- c(selPredVars, predii)
+    selVars <- c(selVars, v)
+    YTlogNV <- rbind(YTlogNV, data.frame(Pred = predii, loglike = likehoodlog))
+  }
+}
+
+kable(YTlogNV, digits = 4, align = 'lc')
+select_variable_log <- as.character(YTlogNV$Pred)
+```
+
+```{r}
+cormap <- YTNVdata %>%
+  cbind(subscriberupbool = YT$subscribersupbool) %>%
+  cor() %>%
+  as.table() %>%
+  as.data.frame() %>%
+  filter(Var1 == "subscriberupbool") %>%
+  filter(Var2 != "subscriberupbool") %>%
+  filter(Var2 != "subscribers") %>%
+  distinct(Var2, .keep_all = TRUE) %>%
+  filter(Freq >= 0.05)
+
+
+select_variable_corelation <- as.character(cormap$Var2)
+select_variable_ODDcorelation <- as.character(cormap$Var2)[seq(1, length(as.character(cormap$Var2)), by = 2)]
+select_variable_EVENcorelation <- as.character(cormap$Var2)[seq(2, length(as.character(cormap$Var2)), by = 2)]
+select_variable_log <- as.character(YTlogNV$Pred)
+kable(cormap)
+```
+
+Another technique employed is examining the correlation between the predictor variables and the target variables. A significant relationship is shown by a correlation coefficient that is higher than a certain threshold, 0.05 in this case. Additionally, this technique is further refined by separating the selected variables into two group: *odd-indexed* and *even-indexed* variable for more understanding of the relationships between the predictor variables and the target variable. As a result, there are total of eleven variables chosen as feature variables as listed above.
+
+## Multivariate models
+
+### Model Evaluation
+
+The function below is used to evaluate the various models that will be built. The output of the function include ROC plot, confusion matrix, log likelihood, prediction distribution plot, and precision or recall plot.
+
+```{r}
+Multimodellikelog <- data.frame(name = character(), 'model Log likelihood' = numeric(), 'Null log likelihood' = numeric(0))
+Multimodelauc <-  data.frame(Pred = character(), Type = character(), TrainAuc = numeric(), CalAUC = numeric())
+YTmodeleval <- function(namea, predmodel, trueV, do.print = TRUE, threshold = 0.5, pos = pos.label, selection = "all"){
+  evalmodelauc <- YTAUC(predmodel, trueV)
+  if (do.print == TRUE) {
+    if (selection %in% c("all", "conma")) {
+      YTCMtable <- table(pred = predmodel > threshold, true.values = trueV)
+      
+      TP <- YTCMtable[2, 2]
+      FP <- YTCMtable[1, 2]
+      FN <- YTCMtable[2, 1]
+      
+      precision <- TP / (TP + FP)
+      recall <- TP / (TP + FN)
+      
+      cat("Precision:", precision, "\nRecall:", recall, "\nConfusion matrix for", namea, "\n")
+      print(kable(YTCMtable))
+    }
+    
+    if (selection %in% c("all", "loglike")){
+        Nullpre <- mean(trueV == pos.label)
+        YTmultilog <- YTlog(trueV, predmodel)
+        nullmultilog <- YTlog(trueV, Nullpre)
+        rowlog<- data.frame(name = namea, 'model Log likelihood' = YTmultilog, 'Null log likelihood' = nullmultilog)
+        Multimodellikelog <<- rbind(Multimodellikelog, rowlog)
+        cat("Model Log Likelihood is", YTmultilog, "and null Log Likelihood is", nullmultilog, ".\n")
+    }
+    
+    if (selection %in% c("all", "roc")) {
+      perf <- performance(prediction(predmodel, trueV), "tpr", "fpr")
+      YTROCMulti <- data.frame(
+        FPR = unlist(perf@x.values),
+        TPR = unlist(perf@y.values),
+        threshold = unlist(perf@alpha.values)
+      )
+      
+      print(ggplot(YTROCMulti, aes(x = FPR, y = TPR)) +
+        geom_line(color = "blue") +
+        geom_abline(intercept = 0, slope = 1, linetype = 'dashed', color = "red") +
+        labs(x = "FPR", y = "TPR", title = paste("ROC Curve for", namea)) +
+        theme_minimal())
+    }
+    if (selection %in% c("all", "Predpplot")) {
+        PredPplot <- data.frame(predi = predmodel, truevalue = trueV)
+        
+        plot <- ggplot(PredPplot, aes(x = predi, color = truevalue)) +
+          geom_density() +
+          labs(x = "Predicted probability", title = paste("Prediction distribution plot for", namea)) +
+          theme_minimal()
+        
+        print(plot)
+      }
+
+    if (selection == "all" || selection == "Prereplot") {
+          YTprec <- performance(prediction(predmodel, trueV), measure="prec")
+          YTrec <- performance(prediction(predmodel, trueV), measure="rec")
+          precision <- (YTprec@y.values)[[1]]
+          YTxprec <- (YTprec@x.values)[[1]] 
+          recall <- (YTrec@y.values)[[1]]
+          rocFrame <- data.frame(threshold=YTxprec, precision=precision, recall=recall)
+          print(ggplot(rocFrame, aes(x=threshold)) +
+              geom_line(aes(y=precision, color="precision")) +
+              geom_line(aes(y=recall, color="recall")) +
+              coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+              labs(x = "threshold", y = "percentage", title = paste("precision and recall plot for", namea)) + 
+              theme_minimal())
+        }
+
+  }
+  evalmodelauc
+}   
+
+YTevalmodelauc <- function(namea, type, name, predmodelfortrain, truefortrain, predmodelforcal, trueforcal, plotname){
+  mtrainauc <- YTmodeleval(namea, predmodelfortrain, truefortrain, do.print = FALSE, selection = plotname)
+  mcalauc <- YTmodeleval(namea, predmodelforcal, trueforcal, do.print = TRUE, selection = plotname)
+  mresultauc <<- data.frame(Pred = namea, Type = type, TrainAuc = mtrainauc, CalAUC = mcalauc)
+  Multimodelauc <<- unique(rbind(Multimodelauc,mresultauc))
+}
+```
+
+### Logistic regression
+
+Logistic regression is applied when predicting the likelihood that an instance will belong to a certain class in binary classification task. It works well in scenarios when the dependent variable is categorical and has two possible outcomes. The binomial distribution is used to describe the probability of the results and optimizes parameters to fit the data. Logistic regression efficiently describes the relationship between the independent variables and the binary and binary goal in a logistic regression analysis. Below is the logistic regression with the selected variables:
+
+First, we use the *even-indexed* data of the correlation:
+
+#### Logistic regression for even feature variables
+```{r, warning=FALSE}
+YTlogicregressionEVENCC <- glm(paste(target, ' ~ ', paste(select_variable_EVENcorelation, collapse=' + '), sep=''), data=YTtrain, family = binomial)
+```
+
+##### Confusion matrix
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for even cc',type = 'multivariate',name = 'logic regression', predmodelfortrain = 
+                 predict(YTlogicregressionEVENCC, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = 
+                 predict(YTlogicregressionEVENCC, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "conma")
+```
+
+The confusion matrix demonstrates how well the model categorizes channels into the specified categories. According to the precision calculation of 0.3511, 35.11% of the high subscriber channels are correctly identified by the model. Recall is calculated as 0.6471, meaning that the model properly recognize 64.71% of the actual high-subscriber channels.
+
+##### Log likelihood
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for even cc',type = 'multivariate',name = 'logic regression', predmodelfortrain = 
+                 predict(YTlogicregressionEVENCC, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = 
+                 predict(YTlogicregressionEVENCC, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "loglike")
+```
+
+The log likelihood for the *Logistic Regression model with even-indexed variables* is -125.8907, which is less than the *Null Model*. It shows that when compared to the baseline, the *logistic regression model with even-indexed variables* does not offer a superior fit to the data.
+
+##### ROC curve plot
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for even cc',type = 'multivariate',name = 'logic regression', predmodelfortrain = 
+                 predict(YTlogicregressionEVENCC, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = 
+                 predict(YTlogicregressionEVENCC, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "roc")
+```
+
+The model is said to outperform the null model if the curve of the model is above the dashed red line. Based on the *ROC Curve* above, it can be noticed that the model's curve is fluctuating above and below the red line, which is not desired.
+
+##### Prediction distribution plot
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for even cc',type = 'multivariate',name = 'logic regression', predmodelfortrain = 
+                 predict(YTlogicregressionEVENCC, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = 
+                 predict(YTlogicregressionEVENCC, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "Predpplot")
+```
+
+The prediction distribution of predicted probabilities for each class is shown in the plot above. It facilitates in the visualization of the prediction confidence of the model.
+
+##### Precision and recall plot
+
+```{r, warning=FALSE}
+YTevalmodelauc(namea = 'logic regression for even cc',type = 'multivariate',name = 'logic regression', predmodelfortrain = 
+                 predict(YTlogicregressionEVENCC, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = 
+                 predict(YTlogicregressionEVENCC, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "Prereplot")
+```
+
+The precision and recall values at various threshold are displayed in the plot above. *Recall* measures the model's capacity to find all relevant instances, while precision measures the accuracy of positive predictions. The plot offers insights into the trade-off between precision and recall.
+
+The overall performance of logistic regression model with even-indexed variables is not good, the other classifier will be used to check which classifier is more suitable. Also, the other combination of the variables will be checked.
+
+#### Logistic Regression with log likelihood variable
+
+```{r, warning=FALSE}
+YTlogicregressionlog <- glm(paste(target, ' ~ ', paste(select_variable_log, collapse=' + '), sep=''), data=YTtrain, family = binomial)
+```
+
+A logistic regression model, `YTlogicregressionlog`, is created by using the log-likelihood variables.
+
+##### Confusion matrix
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for log',type = 'multivariate',name = 'logic regression', predmodelfortrain = predict(YTlogicregressionlog, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = predict(YTlogicregressionlog, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "conma")
+```
+
+The `Logistic Regression with log likelihood variables` has precision high at 98.94%, demonstrating the model's precision in identifying positive cases. Additionally, recall of the model shows 100% which suggests that the training data has been overfitted or that the model has memorized the data.
+
+When a model learns the precise patterns in the training data too well, it is said to have overfitted and fails to be able to generalize to new data as the model memorizes the training set instead of discovering the underlying patterns of the data.
+
+Therefore, high recall is desirable but must be balanced with the model's capacity to generalize to new data, especially in situations where collecting all positive cases is essential.
+
+##### Log likelihood
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for log',type = 'multivariate',name = 'logic regression', predmodelfortrain = predict(YTlogicregressionlog, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = predict(YTlogicregressionlog, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "loglike")
+```
+
+The `ligistic regression model with log likelihood variables` has log likelihood of -36.8378, demonstrating a more favorable fit than the null model, with log likelihood of -123.847.
+
+##### ROC curve plot
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for log',type = 'multivariate',name = 'logic regression', predmodelfortrain = predict(YTlogicregressionlog, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = predict(YTlogicregressionlog, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "roc")
+```
+
+The ROC curve indicates that the model has no discriminative power and is totally random in its ability to identify positive and negative cases.
+
+This is undesirable in most classification tasks since it means the model is not picking up any meaningful patterns in the data, which means it cannot make predictions.
+
+##### Prediction distribution plot
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for log',type = 'multivariate',name = 'logic regression', predmodelfortrain = predict(YTlogicregressionlog, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = predict(YTlogicregressionlog, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "Predpplot")
+```
+
+##### Precision and recall plot
+
+```{r, warning=FALSE}
+YTevalmodelauc(namea = 'logic regression for log',type = 'multivariate',name = 'logic regression', predmodelfortrain = predict(YTlogicregressionlog, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = predict(YTlogicregressionlog, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "Prereplot")
+```
+
+#### Logistic Regression Using Correlation Coefficiont of Odd Variable
+
+In this section, logistic regression is performed using the selected odd variables based on the correlation coefficients with the target variable.
+
+```{r, warning=FALSE}
+YTlogicregressionODDCC <- glm(paste(target, ' ~ ', paste(select_variable_ODDcorelation, collapse=' + '), sep=''), data=YTtrain, family = binomial)
+```
+
+##### Confusion matrix
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for Odd cc',type = 'multivariate',name = 'logic regression', predmodelfortrain = predict(YTlogicregressionODDCC, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = predict(YTlogicregressionODDCC, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "conma")
+```
+
+With a precision of 0.574, the `Logistic Regression Using Correlation Coefficient of Odd Variable` model 57.4% correctly forecasts a channel as having "High Subscribers". According to recall, the model properly predicts 77.1% of all actual "High Subscribers" channels.
+
+##### Log likelihood
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for Odd cc',type = 'multivariate',name = 'logic regression', predmodelfortrain = predict(YTlogicregressionODDCC, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = predict(YTlogicregressionODDCC, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "loglike")
+```
+
+The model's log likelihood is greater than that of the null model, which suggests that the model performs better than null model.
+
+##### ROC curve plot
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for Odd cc',type = 'multivariate',name = 'logic regression', predmodelfortrain = predict(YTlogicregressionODDCC, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = predict(YTlogicregressionODDCC, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "roc")
+```
+
+The *ROC Curve* for this model exhibits a convex form above the null model. This indicates that the model outperforms the null model and better than `Logistic Regression with log likelihood variables`.
+
+##### Prediction distribution plot
+
+```{r}
+YTevalmodelauc(namea = 'logic regression for Odd cc',type = 'multivariate',name = 'logic regression', predmodelfortrain = predict(YTlogicregressionODDCC, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = predict(YTlogicregressionODDCC, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "Predpplot")
+```
+
+##### Precision and recall plot
+
+```{r, warning=FALSE}
+YTevalmodelauc(namea = 'logic regression for Odd cc',type = 'multivariate',name = 'logic regression', predmodelfortrain = predict(YTlogicregressionODDCC, newdata=YTtrain, type = 'response'), truefortrain = YTtrain[, target],predmodelforcal = predict(YTlogicregressionODDCC, newdata=YTCal, type = 'response'), trueforcal = YTCal[, target], plotname = "Prereplot")
+```
+
+The precision for the model is initially relatively low as the model anticipates more low threshold. Precision improves as the threshold rises, indicating fewer false positives. On the contrary, recall is high at lower threshold, but as the threshold rises, recall declines. This indicates that at lower thresholds, the model captures the majority of true "High Subscribers", but at higher thresholds, it misses some.
+
+Overall, based on the correlation coefficients, the logistic regression model with odd variables performs well compared with other model.
+
+### Decision Tree
+
+#### Decision Tree variable for even feature variable
+
+A decision tree model is built based on the correlation coefficients for even variables.
+
+```{r}
+YTEVENCCDT <- rpart(paste(target, ' ~ ', paste(select_variable_EVENcorelation, collapse=' + '), sep=''),data=YTtrain)
+rpart.plot(YTEVENCCDT)
+```
+
+##### Confusion matrix
+
+```{r}
+YTevalmodelauc(namea = 'Decision Tree for even cc', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTEVENCCDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTEVENCCDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "conma")
+```
+
+A precision of 0.5745 is shown in the *Decision Tree for Even Correlation Coefficients*, meaning that 57.45% of the channels with high subscriber counts that are predicted are indeed high subscriber channels. Recall, on the other hand, is calculated as 0.6353, indicating that the model successfully predict 63.53% of the actual high subscriber channels.
+
+##### Log likelihood
+
+```{r}
+YTevalmodelauc(namea = 'Decision Tree for even cc', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTEVENCCDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTEVENCCDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "loglike")
+```
+
+The log likelihood for the *Decision Tree for Even Correlation Coefficients* model is given as -123.9011 whereas the null model has log likelihood of -123.847. The model does not show much difference with the null model.
+
+##### ROC curve plot
+
+```{r}
+YTevalmodelauc(namea = 'Decision Tree for even cc', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTEVENCCDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTEVENCCDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "roc")
+```
+
+Given that the *ROC Curve* is above the line of null mode, the *Decision Tree classifier for the even correlation coefficient* dataset exhibits some predictive power.
+
+##### Prediction distribution plot
+
+```{r, warning=FALSE}
+YTevalmodelauc(namea = 'Decision Tree for even cc', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTEVENCCDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTEVENCCDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "Predpplot")
+```
+
+The *decision tree for the even correlation coefficient* shows significant overlap between the projected predicted probability distributions for the two classes. The overlap between two classes raises the possibility that, in some circumstances, the model may have troublr distinguishing between two classes.
+
+##### Precision and recall plot
+
+```{r, warning=FALSE}
+YTevalmodelauc(namea = 'Decision Tree for even cc', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTEVENCCDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTEVENCCDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "Prereplot")
+```
+
+As the threshold rises, recall decreases almost linearly. This pattern of behavior is normal, as the threshold rises, the classifier turns more conservative, predicting fewer positives, hence lowering recall. The precision indicated by the red curve begins with a low value at a threshold and then peaks at a certain threshold before beginning to decline. The precision curve is less stable than the recall curve.
+
+#### Decision Tree With Log Likelihood Variable
+
+A decision tree model is created by utilizing features chosen based on the log probability variable.
+
+```{r}
+YTlogDT <- rpart(paste(target, ' ~ ', paste(select_variable_log, collapse=' + '), sep=''),data=YTtrain)
+rpart.plot(YTlogDT)
+```
+
+##### Confusion matrix
+
+```{r}
+YTevalmodelauc(namea = 'Decision Tree for log', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTlogDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTlogDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "conma")
+```
+
+Precision of 0.9894 shows that 98.94% of the positive instances predicted are actually positive instances. Recall of 1 means that 100% of all actual positives are accurately identified by the model. However, as stated before, this indicates overfitting which means the model may memorize the data instead of finding the patterns of the data which is not desirable.
+
+##### Log likelihood
+
+```{r}
+YTevalmodelauc(namea = 'Decision Tree for log', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTlogDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTlogDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "loglike")
+```
+
+In comparison to the null model, the model log likelihood performs much better than the null model log likelihood, showing a considerable improvement in capturing the data patterns.
+
+##### ROC curve plot
+
+```{r}
+YTevalmodelauc(namea = 'Decision Tree for log', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTlogDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTlogDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "roc")
+```
+
+The curve indicates prefect or nearly perfect classification that the model has attained an extraordinary high level of accuracy in classification tasks. However, it is not a positive sign as the model is overfitting, lacking of robustness, and suspicion of data leakage. It is crucial to guarantee that the model works well with new data and is resilient to changes in input.
+
+##### Prediction distribution plot
+
+```{r, warning=FALSE}
+YTevalmodelauc(namea = 'Decision Tree for log', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTlogDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTlogDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "Predpplot")
+```
+
+The spikes close to 0 and 1 suggest that the model is quite confident in its predictions for the majority of the data points.
+
+##### Precision and recall plot
+
+```{r, warning=FALSE}
+YTevalmodelauc(namea = 'Decision Tree for log', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTlogDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTlogDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "Prereplot")
+```
+
+#### Decision Tree for Odd feature Variable
+
+A decision tree model's features are chosen based on the correlation coefficient variable for odd variables.
+
+```{r}
+YTODDCCDT <- rpart(paste(target, ' ~ ', paste(select_variable_ODDcorelation, collapse=' + '), sep=''),data=YTtrain)
+rpart.plot(YTODDCCDT)
+```
+
+##### Confusion matrix
+
+```{r}
+YTevalmodelauc(namea = 'Decision Tree for odd cc', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTODDCCDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTODDCCDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "conma")
+```
+
+Precision of 0.5319 shows that 53.19% of the positive instances predicted are indeed positive instances. Recall of 0.7143 shows that 71.43% of all actual positives are accurately identified by the model.
+
+##### Log likelihood
+
+```{r}
+YTevalmodelauc(namea = 'Decision Tree for odd cc', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTODDCCDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTODDCCDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "loglike")
+```
+
+In comparison to the baseline, null model, the model log likelihood performs much better than the null model log likelihood, showing a considerable improvement in capturing the patterns of the data.
+
+##### ROC curve plot
+
+```{r}
+YTevalmodelauc(namea = 'Decision Tree for odd cc', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTODDCCDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTODDCCDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "roc")
+```
+
+The *ROC Curve* appears to be above the line of the null model, demonstrating the model's ability to make predictions. There is potential for improvement as the curve is not particularly close to the top-left corner.
+
+##### Prediction distribution plot
+
+```{r, warning=FALSE}
+YTevalmodelauc(namea = 'Decision Tree for odd cc', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTODDCCDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTODDCCDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "Predpplot")
+```
+
+The spread of the blue line represents a wider range of probabilities for the high subscriber channels, while the spike for the red line to the left indicates a high density of predictions leaning towards the low subscriber channels.
+
+##### Precision and recall plot
+
+```{r, warning=FALSE}
+YTevalmodelauc(namea = 'Decision Tree for odd cc', type = 'multivariate', name = 'Decision Tree', predmodelfortrain = predict(YTODDCCDT, newdata=YTtrain)[,pos.label], truefortrain = YTtrain[,target], predmodelforcal = predict(YTODDCCDT, newdata=YTCal)[,pos.label],trueforcal = YTCal[,target], plotname = "Prereplot")
+```
+
+There appears to be a trade-off between precision and recall. Recall decreases as precision increases, and vice versa.
+
+### KNN
+
+The k-Nearest Neighbors (kNN) with k=3 is used for classification. In this situation, k=3 denotes that when classifying a new data point, the model takes into account its three closest neighbors.
+
+#### KNN For Correlation Coefficiont Variable For Even Variable
+
+```{r}
+YTknntrainevenCC <- knn(YTtrain[select_variable_EVENcorelation], YTtrain[select_variable_EVENcorelation], YTtrain[,target], k=3, prob=T)
+YTknnCalevenCC <- knn(YTtrain[select_variable_EVENcorelation], YTCal[select_variable_EVENcorelation], YTtrain[,target], k=3, prob=T)
+YTtrainknnProbevenCC <- attributes(YTknntrainevenCC)$prob
+YTcalknnProbevenCC <- attributes(YTknnCalevenCC)$prob
+```
+
+The KNN model is built by the correlation coefficient variable for even variables.
+
+##### Confusion matrix
+
+```{r}
+knntable <- table(actual=YTCal[,target], predicted=YTknnCalevenCC)
+      
+TP <- knntable[2, 2]
+FP <- knntable[1, 2]
+FN <- knntable[2, 1]
+      
+precision <- TP / (TP + FP)
+recall <- TP / (TP + FN)
+      
+cat("Precision:", precision, "\nRecall:", recall, "\nConfusion matrix for knn mode.\n")
+print(kable(knntable))
+```
+
+The kNN model shows a precision of 0.5495 and a recall of 0.5319 when tested on the calibration set. This shows that 53.19% of the actual high subscriber channels are accurately recognized by the model, and that 54.95% of the channels that are classified as high subscriber channels by the model are actually high subscriber channels. Given the values, the model has a moderate capacity to classify positives accurately.
+
+##### AUC
+
+```{r}
+YTKNNcalauc <- YTAUC(YTcalknnProbevenCC, YTCal[,target])
+YTknntrainevenCCauc <- YTAUC(YTtrainknnProbevenCC, YTtrain[,target])
+KNNauc <- data.frame(Pred = "KNN for even CC", Type = 'multivariate', TrainAuc = YTknntrainevenCCauc, CalAUC = YTKNNcalauc)
+Multimodelauc <- unique(rbind(Multimodelauc,KNNauc))
+kable(KNNauc)
+```
+
+The *Area Under the Curve (AUC)* of the training set is 0.4785 which is lower than the null model. On the other hand, the calibration set is 0.5119 is relatively low, only above the threshold for the null model.
+
+##### Prediction distribution plot
+
+```{r}
+knnplot <- function(predmodel, trueV, titleString="ROC plot") {
+      perf <- performance(prediction(predmodel, trueV), "tpr", "fpr")
+      YTROknn <- data.frame(
+        FPR = unlist(perf@x.values),
+        TPR = unlist(perf@y.values),
+        threshold = unlist(perf@alpha.values)
+      )
+      
+      ggplot(YTROknn, aes(x = FPR, y = TPR)) +
+        geom_line(color = "blue") +
+        geom_abline(intercept = 0, slope = 1, linetype = 'dashed', color = "red") +
+        labs(x = "FPR", y = "TPR", title=titleString) +
+        theme_minimal()
+}
+knnplot(YTcalknnProbevenCC , YTCal[,target], titleString="AUC of kNN predictions for even CC")
+```
+
+The *true positive rate (TPR)* is plotted against the *false positive rate (FPR)* trade-off and shown in further detail by the AUC plot, which also illustrates performance of the kNN model. The red dashed line denotes random chance, which is the *Null Model*, whereas the blue curve represents the performance of the kNN model. The model's curve is just a little above the null model.
+
+##### Precision and recall plot
+
+```{r, warning=FALSE}
+knnprreplot <- function(predmodel, trueV, namea) {          
+  YTprec <- performance(prediction(predmodel, trueV), measure="prec")
+          YTrec <- performance(prediction(predmodel, trueV), measure="rec")
+          precision <- (YTprec@y.values)[[1]]
+          YTxprec <- (YTprec@x.values)[[1]] 
+          recall <- (YTrec@y.values)[[1]]
+          rocFrame <- data.frame(threshold=YTxprec, precision=precision, recall=recall)
+          ggplot(rocFrame, aes(x=threshold)) +
+              geom_line(aes(y=precision, color="precision")) +
+              geom_line(aes(y=recall, color="recall")) +
+              coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+              labs(x = "threshold", y = "percentage", title = paste("precision and recall plot for", namea)) + 
+              theme_minimal()
+          
+}
+knnprreplot(YTcalknnProbevenCC , YTCal[,target], 'KNN for even cc')
+```
+
+The *precision and recall plot for kNN* shows how accuracy precision and recall balance out at various threshold values. In the kNN model, recall drops sharply and neither precision nor recall are achieving very high values, indicating possible model improvement opportunities.
+
+In summary, the *KNN model for carrelation coefficient for even variables* gas limited potential to differenciate the two classes of channels.
+
+#### KNN for log likelihood variables
+
+```{r}
+YTknntrainlog <- knn(YTtrain[select_variable_log], YTtrain[select_variable_log], YTtrain[,target], k=3, prob=T)
+YTknnCal <- knn(YTtrain[select_variable_log], YTCal[select_variable_log], YTtrain[,target], k=3, prob=T)
+YTtrainknnProblog <- attributes(YTknntrainlog)$prob
+YTcalknnProblog <- attributes(YTknnCal)$prob
+```
+
+The KNN model is built using log likelihood variables.
+
+##### Confusion matrix
+
+```{r}
+knntable <- table(actual=YTCal[,target], predicted=YTknnCal)
+      
+TP <- knntable[2, 2]
+FP <- knntable[1, 2]
+FN <- knntable[2, 1]
+      
+precision <- TP / (TP + FP)
+recall <- TP / (TP + FN)
+      
+cat("Precision:", precision, "\nRecall:", recall, "\nConfusion matrix for knn mode.\n")
+print(kable(knntable))
+```
+
+The `KNN model With Log Likelihood Variable` shows precision of 1 which indicates that the model is overfitting that is not desirable. Recall of 0.9894 indicates that 98.94% of all real positives are accurately identified by the model.
+
+##### AUC
+
+```{r}
+YTKNNcalauc <- YTAUC(YTcalknnProblog, YTCal[,target])
+YTKNNtrainauc <- YTAUC(YTtrainknnProblog, YTtrain[,target])
+KNNauc <- data.frame(Pred = "KNN", Type = 'multivariate', TrainAuc = YTKNNtrainauc, CalAUC = YTKNNcalauc)
+Multimodelauc <- unique(rbind(Multimodelauc,KNNauc))
+kable(KNNauc)
+```
+
+The *AUC value* for the training set (0.5034) and calibration set (0.5059) are nearly equal to 0.5, showing that the model's ability to distinguish is comparable to the null model.
+
+##### Prediction distribution plot
+
+```{r}
+knnplot <- function(predmodel, trueV, titleString="ROC plot for log") {
+      perf <- performance(prediction(predmodel, trueV), "tpr", "fpr")
+      YTROknn <- data.frame(
+        FPR = unlist(perf@x.values),
+        TPR = unlist(perf@y.values),
+        threshold = unlist(perf@alpha.values)
+      )
+      
+      ggplot(YTROknn, aes(x = FPR, y = TPR)) +
+        geom_line(color = "blue") +
+        geom_abline(intercept = 0, slope = 1, linetype = 'dashed', color = "red") +
+        labs(x = "FPR", y = "TPR", title=titleString) +
+        theme_minimal()
+}
+knnplot(YTcalknnProblog , YTCal[,target], titleString="AUC of kNN predictions for log")
+```
+
+The line of the model, represented by the blue line, is almost the same as the null model, represented by the red line.
+
+##### Precision and recall plot
+
+```{r, warning=FALSE}
+knnprreplot <- function(predmodel, trueV, namea) {          
+  YTprec <- performance(prediction(predmodel, trueV), measure="prec")
+          YTrec <- performance(prediction(predmodel, trueV), measure="rec")
+          precision <- (YTprec@y.values)[[1]]
+          YTxprec <- (YTprec@x.values)[[1]] 
+          recall <- (YTrec@y.values)[[1]]
+          rocFrame <- data.frame(threshold=YTxprec, precision=precision, recall=recall)
+          ggplot(rocFrame, aes(x=threshold)) +
+              geom_line(aes(y=precision, color="precision")) +
+              geom_line(aes(y=recall, color="recall")) +
+              coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+              labs(x = "threshold", y = "percentage", title = paste("precision and recall plot for", namea)) + 
+              theme_minimal()
+          
+}
+knnprreplot(YTcalknnProblog , YTCal[,target], 'KNN for log')
+```
+
+The precision and recall plot shows a sharp decline in recall as the threshold gets closer to 1. This implies that the model tends to predict fewer channels as high subscriber as the threshold increases.
+
+#### correlation coefficiont variable for odd variable
+
+```{r}
+YTknntrainODDcc <- knn(YTtrain[select_variable_ODDcorelation], YTtrain[select_variable_ODDcorelation], YTtrain[,target], k=3, prob=T)
+YTknnCalODdcc <- knn(YTtrain[select_variable_ODDcorelation], YTCal[select_variable_ODDcorelation], YTtrain[,target], k=3, prob=T)
+YTtrainknnProbodCC <- attributes(YTknntrainODDcc)$prob
+YTcalknnProbodCC <- attributes(YTknnCalODdcc)$prob
+```
+
+The KNN model is constructed using correlation coefficient of odd variables.
+
+##### Confusion matrix
+
+```{r}
+knntable <- table(actual=YTCal[,target], predicted=YTknnCalODdcc)
+      
+TP <- knntable[2, 2]
+FP <- knntable[1, 2]
+FN <- knntable[2, 1]
+      
+precision <- TP / (TP + FP)
+recall <- TP / (TP + FN)
+      
+cat("Precision:", precision, "\nRecall:", recall, "\nConfusion matrix for knn mode.\n")
+print(kable(knntable))
+```
+
+Precision of 0.6292 shows that around 62.92% of predictions for positive instances are true positives. Recall of 0.5957 indicates that 59.57% of all actual positives are accurately identified by the model.
+
+##### AUC
+
+```{r}
+YTKNNcalauc <- YTAUC(YTcalknnProbodCC, YTCal[,target])
+YTKNNtrainauc <- YTAUC(YTtrainknnProbodCC, YTtrain[,target])
+KNNauc <- data.frame(Pred = "KNN", Type = 'multivariate', TrainAuc = YTKNNtrainauc, CalAUC = YTKNNcalauc)
+Multimodelauc <- unique(rbind(Multimodelauc,KNNauc))
+kable(KNNauc)
+```
+
+The *AUC values* for the training set (0.5609) and the calibration set (0.5629) show that the model's ability to distinguish is slightly better compared to null model. However, the ability to distinguish is still limited.
+
+##### Prediction distribution plot
+
+```{r}
+knnplot <- function(predmodel, trueV, titleString="ROC plot") {
+      perf <- performance(prediction(predmodel, trueV), "tpr", "fpr")
+      YTROknn <- data.frame(
+        FPR = unlist(perf@x.values),
+        TPR = unlist(perf@y.values),
+        threshold = unlist(perf@alpha.values)
+      )
+      
+      ggplot(YTROknn, aes(x = FPR, y = TPR)) +
+        geom_line(color = "blue") +
+        geom_abline(intercept = 0, slope = 1, linetype = 'dashed', color = "red") +
+        labs(x = "FPR", y = "TPR", title=titleString) +
+        theme_minimal()
+}
+knnplot(YTcalknnProbodCC , YTCal[,target], titleString="AUC of kNN predictions of odd cc")
+```
+
+The model outperforms slightly better the null model but there is still improvement needed.
+
+##### Precision and recall plot
+
+```{r, warning=FALSE}
+knnprreplot <- function(predmodel, trueV, namea) {          
+  YTprec <- performance(prediction(predmodel, trueV), measure="prec")
+          YTrec <- performance(prediction(predmodel, trueV), measure="rec")
+          precision <- (YTprec@y.values)[[1]]
+          YTxprec <- (YTprec@x.values)[[1]] 
+          recall <- (YTrec@y.values)[[1]]
+          rocFrame <- data.frame(threshold=YTxprec, precision=precision, recall=recall)
+          ggplot(rocFrame, aes(x=threshold)) +
+              geom_line(aes(y=precision, color="precision")) +
+              geom_line(aes(y=recall, color="recall")) +
+              coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+              labs(x = "threshold", y = "percentage", title = paste("precision and recall plot for", namea)) + 
+              theme_minimal()
+          
+}
+knnprreplot(YTcalknnProbodCC , YTCal[,target], 'KNN of odd cc')
+```
+
+Recall drops dramatically as the threshold rises, indicating that when the threshold rises, the model becomes less confident in its positive predictions. Although the recall decreases, precision remains relatively high, showing that the model's positive predictions are mostly correct. The model is missing many true positives based on the dramatic drop in recall with rising threshold.
+
+### Model Comparison
+
+```{r}
+kable(Multimodellikelog)
+```
+
+When compared to the *Null log likelihood*, `Decision Tree for Log` has the highest log likelihood value, -5.4624. This suggests that among the decision tree models, it offers the best fit to the data. `Logistic regression for log` also stands out with a very high log likelihood, indicating that this model also fits the data rather well.
+
+```{r}
+colnames(AUCYTNV) <- colnames(Multimodelauc)
+AUCtotaltable <- rbind(Multimodelauc, AUCYTNV)
+kable(head(AUCtotaltable[order(AUCtotaltable$CalAUC, decreasing = T), ], 10))
+```
+
+The *TrainAUC* for `Logic regression for log` is 0.9999, which is nearly perfect. It also has a very high *CalAUC* of 0.9929, which indicates great performance in both training and testing. With a CalAUC of 0.9947, `Decision Tree for Log` also shows a great performance. However, as the true positives (TP) for both of the model stated above are 0, these two models will not be taken into consideration. As a result, `logic regression for Odd cc` model will be selected as its *TrainAUC* is 0.8058 and *CalAUC* is 0.7324. It perform much better than the other models.
+
+```{r}
+YTdiffModel <- list(
+  list(predmodel = predict(YTlogicregressionEVENCC, newdata = YTtrain, type = 'response'), trueV = YTtrain[, target], namea = "LogisticRegression for evencc"),
+  list(predmodel = predict(YTlogicregressionODDCC, newdata = YTtrain, type = 'response'), trueV = YTtrain[, target], namea = "LogisticRegression for ODDcc"),
+  list(predmodel = predict(YTlogicregressionEVENCC, newdata = YTtrain, type = 'response'), trueV = YTtrain[, target], namea = "LogisticRegression for evencc"),
+  list(predmodel = predict(YTEVENCCDT, newdata = YTtrain)[, pos.label], trueV = YTtrain[, target], namea = "DecisionTree for even CC"),
+  list(predmodel = predict(YTlogDT, newdata = YTtrain)[, pos.label], trueV = YTtrain[, target], namea = "DecisionTree for log"),
+  list(predmodel = predict(YTODDCCDT, newdata = YTtrain)[, pos.label], trueV = YTtrain[, target], namea = "DecisionTree for odd CC"),
+  list(predmodel = YTcalknnProbevenCC, trueV = YTCal[, target], namea = "KNN for even cc"),
+  list(predmodel = YTcalknnProblog, trueV = YTCal[, target], namea = "KNN for log"),
+  list(predmodel = YTcalknnProbodCC, trueV = YTCal[, target], namea = "KNN for odd cc")
+)
+
+YTmodels <- do.call(rbind, lapply(YTdiffModel, as.data.frame))
+
+YTrocG <- list()
+
+for (model_name in unique(YTmodels$namea)) {
+  model_subset <- YTmodels[YTmodels$namea == model_name, ]
+  perf <- performance(prediction(model_subset$predmodel, model_subset$trueV), "tpr", "fpr")
+  YTROCMulti <- data.frame(
+    FPR = unlist(perf@x.values),
+    TPR = unlist(perf@y.values),
+    threshold = unlist(perf@alpha.values),
+    namea = model_name
+  )
+  YTrocG[[model_name]] <- YTROCMulti
+}
+
+combined_roc <- do.call(rbind, YTrocG)
+
+ggplot(combined_roc, aes(x = FPR, y = TPR, color = namea)) +
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dashed', color = "red") + 
+  labs(x = "FPR", y = "TPR", title = "ROC Curves for Multiple Models") +
+  labs(color = "Model") +
+  theme_minimal()
+```
+
+In conclusion, although the `Decision Tree for log` seems to be perfect, it is overfitting that it may not predict the new data accurately. Hence, `Logistic Regression of Correlation Coefficient for Odd Variables` outperforms the other model.
+
+## Final select model
+
+As a result, `Logistic Regression of Correlation Coefficient for Odd Variables` is selected as the final mode. The evaluation of the final selected model by usign the testing set is shown below.
+
+##### Confusion matrix
+
+```{r}
+predicted_values <- predict(YTlogicregressionODDCC, newdata=YTtest, type = 'response')
+YTmodeleval('logistic regression fpr for final model', predicted_values, YTtest[, target], do.print = TRUE, selection = "conma")
+```
+
+Based on these metrics, it appears that 58.42% of the model's positive predictions are accurate. Additionally, the model is able to recognize approximately 80.82% of all true positive.
+
+##### loglikelihood
+
+```{r}
+predicted_values <- predict(YTlogicregressionODDCC, newdata=YTtest, type = 'response')
+YTmodeleval('logistic regression fpr for final model', predicted_values, YTtest[, target], do.print = TRUE, selection = "loglike")
+```
+
+The log likelihood value represents how well the model fits the data. The closer the number is to 0, the model fits the data better. The `Logistic Regression of Correlation Coefficient for Odd Variables` model is better than the null model as it is nearer than 0 compared to the null model.
+
+##### ROC
+
+```{r}
+predicted_values <- predict(YTlogicregressionODDCC, newdata=YTtest, type = 'response')
+YTmodeleval('logistic regression fpr for final model', predicted_values, YTtest[, target], do.print = TRUE, selection = "roc")
+```
+
+The model's classification is obvious from the supplied graph, where the blue curve consistently maintains a large distance above the null model.
+
+##### Prediction distribution plot
+
+```{r}
+predicted_values <- predict(YTlogicregressionODDCC, newdata=YTtest, type = 'response')
+YTmodeleval('logistic regression fpr for final model', predicted_values, YTtest[, target], do.print = TRUE, selection = "Predpplot")
+```
+
+##### Precision and recall plot
+
+```{r, warning=FALSE}
+predicted_values <- predict(YTlogicregressionODDCC, newdata=YTtest, type = 'response')
+YTmodeleval('logistic regression fpr for final model', predicted_values, YTtest[, target], do.print = TRUE, selection = "Prereplot")
+```
+
+## Conclusion
+
+In terms of model selection, single variable model, multivariate models, logistic regression, decision tree, and KNN model are used. Through the comparison of *AUC*, *confusion matrix*, *ROC curve*, *predicted distribution*, and *precision and recall plot*, `logistic regression` is the most accurate model among the other model. Besides, *log likelihood*, *odd variables*, *even variables* are used and `odd variables` provides more accurate predictions. Hence, `logistic regression with correlation coefficient of odd variables` is chosen as the final model to do the predictions.
+
+# Clustering
+
+The data is being reselected and transformed for clustering. Some variables such as *unemployment rate* and *gross tertiary education enrollment* are converted from percentage to the actual number of unemployed people based on population, monthly earnings and yearly earnings are transformed. Next, using the `select` function, redundant columns that are not numerical variables and has been transformed. Then using `filter` function, rows with missing values for particular columns are removed. Lastly, columns means are used to impute missing values in the dataset.
+
+## Data Preparation
+
+```{r}
+YT_cluster <- read.csv("./youtube_UTF_8.csv", header = TRUE, encoding = "UTF-8")
+YTNV_cluster <- YT_cluster %>%
+  mutate(
+    allunemployment = (Unemployment.rate / 100) * Population,
+    unemployment_urban = (Unemployment.rate / 100) * Urban_population,
+    educationall = (Gross.tertiary.education.enrollment.... / 100) * Population,
+    educationurban = (Gross.tertiary.education.enrollment.... / 100) * Urban_population,
+    averagemonthearning = (lowest_yearly_earnings+ highest_yearly_earnings) / 2,
+    averageyearearning = (lowest_monthly_earnings+ highest_monthly_earnings) / 2
+  ) %>%
+  select(-highest_monthly_earnings, -lowest_monthly_earnings, -lowest_yearly_earnings, -highest_yearly_earnings, -Gross.tertiary.education.enrollment...., -Unemployment.rate, -video_views_rank, -country_rank, -channel_type_rank, -created_year, -created_date) %>%
+  filter(rowSums(is.na(select(., (ncol(.)-9):(ncol(.)-2)))) == 0) %>%
+  select_if(is.numeric)  %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+```
+
+Descriptive statistics for the new data like *minimum*, *median*, *mean*, *standard deviation*, and *maximum* are performed for data checking.
+
+```{r}
+YTNV_cluster_summary <- data.frame(
+  Min = sapply(YTNV_cluster, min),
+  Med = sapply(YTNV_cluster, median),
+  Mean = sapply(YTNV_cluster, mean),
+  Max = sapply(YTNV_cluster, max),
+  SD = sapply(YTNV_cluster, sd)
+)
+kable(YTNV_cluster_summary, align = "lccccc")
+```
+
+## Data Scaling
+
+Standardize the data to have a mean of 0 and a standard deviation of 1 for each variable. This makes sure that no single variable's scale improperly affects the cluster formation.
+
+```{r}
+vars.to.use <- colnames(YTNV_cluster)[-2]
+scaled_df <- scale(YTNV_cluster[,vars.to.use])
+attr(scaled_df, "scaled:center")
+attr(scaled_df, "scaled:scale")
+```
+
+## Hierarchical Clustering
+
+```{r}
+hc <- hclust(dist(scale(YTNV_cluster[,colnames(YTNV_cluster)[-2]]), method = "euclidean"), method = "ward.D2")
+
+hcplot <- as.dendrogram(hc)
+plot(hcplot, ylab = "Height", leaflab = "none", horiz = FALSE)
+hightnu <- c(61.5, 55.4, 33.7)
+coline <- c("royalblue2", "royalblue3", "royalblue4")  
+for (i in 1:length(hightnu)) {
+  abline(h = hightnu[i], col = coline[i], lty = 8, lwd = 1)
+}
+text(3, 20, paste("k >=", 5), col = "blue", cex = 0.6)
+text(3, c(59, 48), paste("k =", 3:4), col = "blue", cex = 0.6)
+text(3, 65, paste("k =", 2), col = "blue", cex = 0.6)
+```
+
+A dendogram illustrates the structure of a dataset by displaying the the link between clusters of data points. A new cluster is created when two branches combined. The blue dotted horizontal lines in the dendogram reflect various levels at which clusters form, and k-values show overall there are how many clusters. Based on the dendogram above, two major clusters are formed when k is equal to 2. The three and four clusters are further divided at k=3 and k=4. At k greater than and equal to 5, the dendogram predicts further subdivisions, but the dendogram above does not explicitly display them. Hence, we need to find the suitable k value.
+
+```{r}
+wss <- function(cluster) {
+  c0 <- colMeans(cluster)
+  sum(apply(cluster, 1, function(row) sum((row - c0) ^ 2)))
+}
+
+# Calculate the total WSS
+Totalwss <- function(df, labels) {
+  sumwss <- 0
+  for (i in 1:length(unique(labels))) {
+    sumwss <- sumwss + wss(subset(df, labels == i))
+  }
+  sumwss
+}
+
+indexch <- function(df, kmax, data) {
+  npts <- nrow(df)
+  wss.value <- numeric(kmax)
+  wss.value[1] <- wss(df)
+  for (k in 2:kmax) {
+    labels <- cutree(data, k)
+    wss.value[k] <- Totalwss(df, labels)
+  }
+  B <- (wss(df) - wss.value)/ (0:(kmax - 1))
+  w <- wss.value / (npts - 1:kmax)
+  data.frame(k = 1:kmax, CH_index = B/w, WSS = wss.value)
+}
+```
+
+The *CH index* is a benchmark for figuring out the ideal cluster count in hierarchical clustering. It strikes a balance between two factors of clustering: Compactness (how far apart elements in a cluster are from one another) and Separation. By determining the distance between data points within a cluster and its center, compactness is determined by how tightly a cluster is. A smaller number indicates clearly defined cluster. On the other hand, separation measures the separation between clusters by computing the distance between the cluster centers and the centroid of the entire dataset. A higher value indicates clear, separated clusters. Hence, a good clustering should have a higher *CH index* that signifies well-separated and have little internal variation. The *k value* with the highest *CH index* that denotes the most distinct and consistent clustering structure, is the goal to identify the ideal cluster number.
+
+```{r, warning=FALSE}
+ch_criterion <- indexch(scaled_df, 10, hc)
+grid.arrange(
+  ggplot(ch_criterion, aes(x = k, y = CH_index)) +
+    geom_point() +
+    geom_line(colour = "red") +
+    scale_x_continuous(breaks = 1:10, labels = 1:10) +
+    labs(y = "CH index") +
+    theme_minimal(),
+  ggplot(ch_criterion, aes(x = k, y = WSS), color = "blue") +
+    geom_point() + geom_line(colour = "blue") +
+    scale_x_continuous(breaks = 1:10, labels = 1:10) +
+    theme_minimal(),
+  ncol = 2
+)
+```
+
+Based on the plot, *CH index* is maximized at k=4 that appears to show a large peak.
+
+```{r}
+plot(hcplot, ylab = "Height", leaflab = "none", horiz = F)
+rect.hclust(hc, k = 4)
+```
+
+The dendogram shows the formation of four clusters by drawing red rectangles around the clusters.
+
+## kmean Clusters
+
+```{r}
+kmch <- kmeansruns(scaled_df, krange=1:10, criterion="ch")
+kmasw <- kmeansruns(scaled_df, krange=1:10, criterion="asw")
+
+kmCritframe <- data.frame(k=1:10, ch=kmch$crit,asw=kmasw$crit)
+grid.arrange(ggplot(kmCritframe, aes(x=k, y=ch)) +
+  geom_point() + geom_line(colour="red") +
+  scale_x_continuous(breaks=1:10, labels=1:10) +
+  labs(y="CH index") +
+    theme_minimal(),
+ggplot(kmCritframe, aes(x=k, y=asw)) +
+  geom_point() + geom_line(colour="blue") +
+  scale_x_continuous(breaks=1:10, labels=1:10) +
+  labs(y="ASW") +
+    theme_minimal(),
+nrow=1)
+```
+
+Plot above demonstrates peaks at particular k values, which may point to the best possible grouping. The best cluster count, according to the *CH index* plot, is k = 3, while the optimum cluster count, according to the *ASW plot* is k = 4.
+
+## Clustersing Visualising
+
+```{r}
+princ <- prcomp(scaled_df)
+project2D <- as.data.frame(predict(princ, newdata = scaled_df)[, 1:2])
+
+convexHullcheck <- function(proj2ddata, groups) {
+  do.call(rbind, lapply(unique(groups), function(c) {
+    f <- subset(proj2ddata, cluster == c)
+    f[chull(f), ]
+  }))
+}
+
+plot_clusters <- function(number) {
+  groups <- cutree(hc, number)
+  convexHulldf <<- cbind(
+    project2D,
+    cluster = as.factor(groups),
+    subscriber = YTNV_cluster$subscribers
+  )
+  convex_hull <<- convexHullcheck(convexHulldf, groups)
+  ggplot(convexHulldf, aes(x = PC1, y = PC2)) +
+    geom_point(aes(shape = cluster, color = cluster, alpha = 0.1)) +
+    geom_polygon(data = convex_hull, aes(group = cluster, fill = cluster), alpha = 0.4, linetype = 0) +
+    labs(title = sprintf("k = %d", number)) +
+    theme(legend.position = "none") +
+    theme_minimal()
+}
+
+# Generate plots for k=3 and k=4
+plots <- lapply(c(3,4), plot_clusters)
+
+# Display plots side by side
+grid.arrange(plots[[1]], plots[[2]], ncol = 2)
+```
+
+The data is divided into two and three clusters and decide which cluster is more ideal.
+
+```{r}
+fviz_cluster(kmeans(scaled_df, 2), scaled_df)
+fviz_cluster(kmeans(scaled_df, 3), scaled_df)
+```
+
+It can be observed when k = 2 the clusters are clearly separated from one another, however when k = 3 there the cluster is overlapping.
+
+## Extract members of each cluster
+
+At this point, the dataset will be clustered using the k-mean algorithm, and the criteria for *Cluster 1* and *Cluster 2* will be determined based on the traits of each cluster after clustering.
+
+```{r}
+set.seed(4009)
+kM <- kmeans(scaled_df, 2)
+CLustersummary <- cbind(YTNV_cluster, cluster = kM$cluster)
+clusters <- table(CLustersummary$cluster)
+```
+
+```{r}
+kable(table(clusters))
+kmresult <- kmeans(scaled_df, 2, nstart=100, iter.max=100)
+kmresult$centers
+kmresult$size
+```
+
+Considering the prior analysis, the dataset is divided into 2 sets of 872 data. *Cluster 1* has been assigned 482 data whereas *Cluster 2* has been assigned 390 data. The data points in *Cluster 1* appear to have relatively higher values for the variables `video.views`, `uploads`, `urban_population`, and `education`. On the other hand, *Cluster 2* appears to reflect data points with average values that are lower for the majority of the variables.
+
+```{r, results='hide'}
+HCdata <- clusterboot(scaled_df, clustermethod=hclustCBI,method="ward.D2", k=2)
+```
+
+```{r}
+summary(HCdata$result)
+1 - HCdata$bootbrd/100
+```
+
+Both the *Cluster 1* and *Cluster 2* are very stable.
+
+## Conclusion
+
+In a nutshell, a deeper comprehension of the underlying structures in the YouTube dataset has been made by clustering analysis. The ideal number of clusters is determined and k=4 clusters are the most effective for our dataset. Key ideas provide the foundation for the rationale behind this.
+
+1. The testing indicates that four clusters provide the optimal clustering, which corresponds to the illustration above that uses the CH index to determine the ideal number pf clusters. This indicates that the data points are distinctly divided from the other groups and densely packed within their respective clusterings.
+
+2. From the perspective of kmeans clustering, k=2 is preferred as it shows a clearer separation with no overlapping.
+
+3.  Finally, since the cluster plot in Kmean cluster is clearer and more dispersed than Hierarchical Clustering, and we can clearly figure out the clusters. We choose Kmean clustering.
+
+# References
+
+Elssied, N. O. F., Ibrahim, O., & Osman, A. H. (2014). A novel feature selection based on one-way anova f-test for e-mail spam classification. *Research Journal of Applied Sciences, Engineering and Technology*, *7*(3), 625-638.
+
+Hsu, H. H., & Hsieh, C. W. (2010). Feature Selection via Correlation Coefficient Clustering. *J. Softw.*, *5*(12), 1371-1377.
+
+Karatza, P., Dalakleidi, K., Athanasiou, M., & Nikita, K. S. (2021, November). Interpretability methods of machine learning algorithms with applications in breast cancer diagnosis. In *2021 43rd Annual International Conference of the IEEE Engineering in Medicine & Biology Society (EMBC)* (pp. 2310-2313). IEEE.
+
+Khalid, S., Khalil, T., & Nasreen, S. (2014, August). A survey of feature selection and feature extraction techniques in machine learning. In 2014 science and information conference (pp. 372-378). IEEE.
+
+Tang, J., Alelyani, S., & Liu, H. (2014). Feature selection for classification: A review. Data classification: Algorithms and applications, 37.
